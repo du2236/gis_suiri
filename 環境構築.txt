@@ -1,0 +1,46 @@
+pip(python installs packages)
+
+pipはPythonのパッケージ管理システム．Pythonで作られたソフトウェアはパッケージという形で配布されるがこれらのパッケージをインストールしたりアップデータしたりアンインストールしたりするツールがpip
+
+pipを使用することでほかの開発者がすでに開発して公開しているPythonパッケージを簡単に導入できる
+
+多くのPythonパッケージはほかのパッケージに依存して機能を提供する．
+https://www.kikagaku.co.jp/kikagaku-blog/python-pip/
+
+pipでできること
+・ライブラリのインストール
+・ライブラリのアンインストール
+・・ライブラリのアップデート
+インストールされているライブラリの確認
+https://qiita.com/starfieldKt/items/ce6add838d61ea3a6f37
+モジュールとは
+Pythonのコードを含んだテキストファイル
+
+パッケージとは
+複数のモジュールを束ねたもの
+
+ライブラリ
+複数のパッケージで成り立っているもの
+
+https://zenn.dev/delacroix/articles/e3f62ca001deb0
+
+https://atmarkit.itmedia.co.jp/ait/articles/1907/09/news010.html
+
+
+anacondaを使わずPythonにGDALをインストール
+
+https://qiita.com/Y1248T/items/9baf8e87edfe08326566
+
+env.yml
+
+既存環境のyml書き出しから新環境を構築するまでのメモ
+https://qiita.com/suzuki0430/items/0bda6a04019cef2eb319
+
+conda install pip
+pip install jupyter notebook
+pip install shapely
+pip install tqdm
+pip install pandas
+pip install GDAL-3.10.1-cp313-cp313-win_amd64.whl
+pip install pyproj
+conda env export > C:\home\ueda\1作業内容\env.yml
