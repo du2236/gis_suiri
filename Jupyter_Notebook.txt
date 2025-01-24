@@ -1,0 +1,53 @@
+Jupyter Notebook
+
+対話的なプログラミング環境でコードの作成と実行，結果の可視化，ドキュメントの作成・共有が行える主にデータサイエンティストが利用するツール
+
+pip uninstall notebook jupyter_contrib_nbextensions jupyter_nbextensions_configurator
+
+conda install -c conda-forge jupyter_contrib_nbextensions
+
+jupyter contrib nbextension install --user
+
+jupyter nbextension enable codefolding/main
+
+https://github.com/ipython-contrib/jupyter_contrib_nbextensions
+
+拡張機能
+
+・2to3 converter いらん
+python2のコードをpython3のコードに変換する
+
+python2は2020年にサポート終了
+
+・Addbefore　△
+(コマンドモードA，B）
+上矢印まる　上にセル挿入（A）
+下矢印まる　下にセル挿入（B）
+
+・autopep8
+前提 pip install autopep8
+フォーマットを整えてくれる
+a=1+1→a = 1 + 1
+ctrl L もしくはボタン　
+
+・AutoSaveTime
+一定時間間隔（任意）で自動保存できるように設定
+
+https://qiita.com/simonritchie/items/88161c806197a0b84174
+
+
+variable Inspector
+https://qiita.com/Gri_Gra/items/0e2aaa7fa25165171656
+
+pep8
+規則
+
+https://www.issoh.co.jp/tech/details/3032/
+
+https://qiita.com/sergicalsix/items/0c3f3e6a8a26770a84be
+
+jupyter notebookではタブ→スペース4に置き換わる
+
+https://github.com/EsriJapan/learn-python-with-arcgis-notebooks?tab=readme-ov-file
+
+mdを参考に
