@@ -1,0 +1,264 @@
+import shapefile
+import numpy as np
+
+def create_raster_from_polygons(shp_path, extent, cellsize, field):
+    left, botm, right, top = extent
+    field = field
+    cols = int((right - left) / cellsize)
+    rows = int((top - botm) / cellsize)
+    
+    raster = np.zeros((rows, cols))
+
+    sf = shapefile.Reader(shp_path)
+
+    for shape, rec in tqdm(zip(sf.shapes(), sf.records()), total = len(sf.shapes())):
+        
+        points = shape.points
+        re = rec[field]
+        parts = list(shape.parts) + [len(points)]  # 各パートの終端インデックスも含める
+        
+        for i in range(len(parts) - 1):
+            
+            ring = points[parts[i]:parts[i+1]]
+            fill_polygon(raster, ring, left, top, cellsize, re)
+    
+    return raster
+
+def fill_polygon(raster, ring, x_origin, y_origin, cellsize, re):
+    rows, cols = raster.shape
+
+    # ポリゴンのバウンディングボックスを取得
+    xs, ys = zip(*ring)
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    # ラスタ上でのインデックス範囲に変換（切り捨て、切り上げで安全側に）
+    min_col = max(0, int((min_x - x_origin) / cellsize) - 1)
+    max_col = min(cols - 1, int((max_x - x_origin) / cellsize) + 1)
+    min_row = max(0, int((y_origin - max_y) / cellsize) - 1)
+    max_row = min(rows - 1, int((y_origin - min_y) / cellsize) + 1)
+
+    for row in range(min_row, max_row + 1):
+        y = y_origin - (row + 0.5) * cellsize
+        for col in range(min_col, max_col + 1):
+            x = x_origin + (col + 0.5) * cellsize
+            if point_in_polygon(x, y, ring):
+                raster[row, col] = re
+
+def point_in_polygon(x, y, ring):
+    """射影交差法＋接点判定つき"""
+    count = 0
+    n = len(ring)
+
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+
+        # 射影交差判定（交差 or 上に接してる場合）
+        if ((y1 > y) != (y2 > y)) or (y1 == y and y2 == y and min(x1, x2) <= x <= max(x1, x2)):
+            x_intersect = x1 + (y - y1) * (x2 - x1) / (y2 - y1 + 1e-10)  # divide by nonzero
+            if x < x_intersect:
+                count += 1
+
+    return count % 2 == 1
+
+
+
+
+#
+import shapefile
+
+def shp_info_all(shp_path):
+    sf = shapefile.Reader(shp_path)
+    
+    bbox = sf.bbox
+    left, botm, right, top = bbox[0], bbox[1], bbox[2], bbox[3]
+    extent = [left, botm, right, top]
+
+    shape_type_name = sf.shapeTypeName
+    num_records = len(sf)
+    
+    fields_raw = sf.fields[1:]  # 最初は削除フラグなので除外
+    field_names = [f[0] for f in fields_raw]
+    field_types = [f[1] for f in fields_raw]
+    field_details = [{"name": f[0], "type": f[1], "size": f[2], "decimal": f[3]} for f in fields_raw]
+
+    records = sf.records()
+
+    shapes = sf.shapes()
+    return extent, shape_type_name, num_records,field_names,field_types,field_details, records
+
+#
+def create_raster_from_polylines(shp_path, extent, resolution, asc_path):
+    """ポリラインをラスタ化してASCファイルとして保存"""
+    # ラスタサイズの計算
+    rr = []
+    x_min, y_min, x_max, y_max = extent
+    cols = int((x_max - x_min) / resolution)
+    rows = int((y_max - y_min) / resolution)
+    raster = np.zeros((rows, cols), dtype=float)  # 0で初期化（浮動小数点）
+
+    # シェープファイルの読み込み
+    sf = shapefile.Reader(shp_path)
+    
+    for shape, rec in zip(sf.shapes(), sf.records()):
+        for i in range(len(shape.points) - 1):
+            x1, y1 = shape.points[i]
+            x2, y2 = shape.points[i + 1]
+            re = rec["th"]
+            
+            # 座標をラスタのインデックスに変換
+            r1 = (y_max - y1) / resolution
+            c1 = (x1 - x_min) / resolution
+            r2 = (y_max - y2) / resolution
+            c2 = (x2 - x_min) / resolution
+            
+            # 浮動小数点の線形補間で滑らかに線を描画
+            draw_smooth_line(raster, r1, c1, r2, c2, rr, re)
+    
+
+    # ASC ファイルとして保存
+    save_asc(raster, x_min, y_min, resolution, asc_path)
+    print("finish")
+    
+
+def draw_smooth_line(raster, r1, c1, r2, c2,rr, re):
+    """線形補間を用いて滑らかに線を描く"""
+    r1, c1, r2, c2 = float(r1), float(c1), float(r2), float(c2)
+    
+    steps = int(max(abs(r2 - r1), abs(c2 - c1)) * 50)  # ステップ数を増やして補間を細かく
+    
+    for t in np.linspace(0, 1, steps):
+        r = r1 + t * (r2 - r1)
+        c = c1 + t * (c2 - c1)
+        rr.append({"x" : c * 5, "y" : 100 - r* 5})
+        ri, ci = int((r)), int((c))  # 最近傍のセルに丸める
+        if 0 <= ri < raster.shape[0] and 0 <= ci < raster.shape[1]:
+            raster[ri, ci] = re  # ラスタに値を設定
+        
+
+def save_asc(raster, x_min, y_min, resolution, asc_path):
+    """ ASC ファイルとして保存 """
+    rows, cols = raster.shape
+    header = f"NCOLS {cols}\nNROWS {rows}\nXLLCORNER {x_min}\nYLLCORNER {y_min}\n"
+    header += f"CELLSIZE {resolution}\nNODATA_VALUE 0\n"
+
+    with open(asc_path, "w") as f:
+        f.write(header)
+        np.savetxt(f, raster, fmt="%.2f", delimiter=" ")
+
+# 実行例
+create_raster_from_polylines(path)
+
+
+#flg
+a = np.zeros((nrows * 2, ncols * 2), dtype=int)
+a[::2, ::2] = 3  # 偶数行・偶数列
+a[::2, 1::2] = 4  # 偶数行・奇数列
+a[1::2, ::2] = 1  # 奇数行・偶数列
+a[1::2, 1::2] = 2  # 奇数行・奇数列
+
+# ベース行データを作成（nrows*2 行）J
+row_values = np.arange(nrows * 2)
+row_values = row_values // 2 + 1  # i // 2 + 1
+
+# 上下反転
+row_values = row_values[::-1]  # [::-1]で上下逆
+
+# 2次元配列にブロードキャストして拡張（同じ値を ncols*2 列に複製）
+a = np.tile(row_values[:, np.newaxis], (1, ncols * 2))
+
+a = np.tile(np.arange(ncols * 2) // 2 + 1, (nrows * 2, 1))#I
+
+mask = data != 0
+df1 = pd.DataFrame({
+    'I': datai[mask],
+    'J': dataj[mask],
+    'num': dataflg[mask],
+})
+
+import numpy as np
+
+# 初期化（0で埋める）
+f1 = np.zeros((nrows, ncols), dtype=int)
+f2 = np.zeros((nrows, ncols), dtype=int)
+f3 = np.zeros((nrows, ncols), dtype=int)
+f4 = np.zeros((nrows, ncols), dtype=int)
+#f5 = np.zeros((nrows, ncols), dtype=float)
+# NumPy配列で取り出す（パフォーマンス向上）
+I = df1["I"].to_numpy() - 1
+J = (df1["J"].to_numpy()) * (-1)
+num = df1["num"].to_numpy()
+#bh = df1["bh"].to_numpy()
+# 一括代入（最小ループ）
+for i, j, n in zip(J, I, num):#,b , bh
+    if n == 1:
+        f1[i, j] = 1
+    elif n == 2:
+        f2[i, j] = 1
+    elif n == 3:
+        f3[i, j] = 1
+    elif n == 4:
+        f4[i, j] = 1
+    #f5[i, j] = b
+
+fff = f1 +f2 +f3 +f4
+
+# 初期化
+tate = np.zeros_like(data)
+yoko = np.zeros_like(data)
+
+# 横方向の条件
+yoko[(f1 == 1) & (f2 == 1)] = 2
+
+# 縦方向の条件
+tate[(f1 == 1) & (f3 == 1)] = 1
+
+# f3 と f4 の組み合わせ（1行上に影響）
+mask_yoko = (f3[1:] == 1) & (f4[1:] == 1)
+yoko[:-1][mask_yoko] = 2
+#f5[:-1][mask_yoko] = f5[1:][mask_yoko] 
+
+# f2 と f4 の組み合わせ（1列右に影響）
+mask_tate = (f2[:, :-1] == 1) & (f4[:, :-1] == 1)
+tate[:, 1:][mask_tate] = 1
+#f5[:, 1:][mask_tate] = f5[:, :-1][mask_tate] 
+
+# 合成フラグ
+flg = tate + yoko
+#f5[(flg == 0)] = 0
+
+def save_asc(raster, x_min, y_min, resolution, asc_path):
+    """ ASC ファイルとして保存 """
+    rows, cols = raster.shape
+    header = f"NCOLS {cols}\nNROWS {rows}\nXLLCORNER {x_min}\nYLLCORNER {y_min}\n"
+    header += f"CELLSIZE {resolution}\nNODATA_VALUE -99\n"
+
+    with open(asc_path, "w") as f:
+        f.write(header)
+        np.savetxt(f, raster, fmt="%.2f", delimiter=" ")
+
+# クリップしたい左下・右上の座標
+clip_xmin, clip_ymin = round(extent[0]), round(extent[1])  # 左下〇
+clip_xmax, clip_ymax = round(extent[2]), round(extent[3])  # 右上
+
+# インデックス計算（x方向は通常、y方向は逆順）
+xi = int((clip_xmin - geotransform[0]) / geotransform[1])
+xj = int((clip_xmax - geotransform[0]) / geotransform[1])
+yi = int((geotransform[3] - clip_ymax) / abs(geotransform[5]))
+yj = int((geotransform[3] - clip_ymin) / abs(geotransform[5]))
+clipped = data[yi:yj, xi:xj]
+
+def ras_info(path):
+    src = gdal.Open(path, gdal.GA_ReadOnly)
+    left, xleng, rotx, top, roty, yleng = src.GetGeoTransform()
+    xsize = src.RasterXSize
+    ysize = src.RasterYSize
+    botm = top + ysize * yleng
+    right = left + xsize * xleng
+    extent = [left, botm, right, top]
+    cellsize = xleng
+    data = src.GetRasterBand(1).ReadAsArray()
+    return extent, xsize, ysize, cellsize, data
+
+extent, xsize, ysize, cellsize, data = ras_info(raster1)
