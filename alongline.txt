@@ -1,0 +1,537 @@
+import arcpy
+import numpy as np
+import pandas as pd
+import shapefile as sf
+import os
+from numpy.linalg import norm
+import ast
+import datetime as dt
+import re
+from osgeo import osr
+
+csv_input_path = arcpy.GetParameterAsText(0)
+map_projection = arcpy.GetParameterAsText(1)
+extent = arcpy.GetParameterAsText(2)
+
+def typhoon():
+
+    global csv_input_path 
+    global extent
+    global map_projection
+    
+    def extract_extent(extent):
+        parts = extent.split()
+        return [int(float(x)) for x in parts[:4]]
+        
+    def load_parameter_blocks(filepath):
+        
+        df = pd.read_csv(filepath, header=None, encoding= 'cp932', skip_blank_lines=False)
+    
+        empty_rows = df[df.isnull().all(axis=1)].index.tolist()
+        blocks = []
+        start = 0
+        for end in empty_rows + [len(df)]:
+            block = df.iloc[start:end].dropna(how='all')
+            if not block.empty:
+                blocks.append(block.reset_index(drop=True))
+            start = end + 1
+    
+        return blocks
+        
+    def prj_path(shp_path, map_projection):
+        
+        prj_path = shp_path.replace("shp", "prj")
+        
+        with open(prj_path, 'w') as _w:
+    
+            _w.write(map_projection)
+            
+            _w.close() 
+
+    def calc_distance(p1, p2):
+        return np.hypot(p1[0] - p2[0], p1[1] - p2[1])
+    
+    def calc_direction(p1, p2):
+        angle = math.atan2(p1[1] - p2[1], p1[0] - p2[0])
+        return math.cos(angle), math.sin(angle)
+        
+    def generate_points_along_line(track_coords, base_point, interval, arrival, decay, closest_idx, pit):
+        all_points = []
+    
+        for dir_flag in range(2):  
+            
+            if dir_flag == 0:
+                index_range = range(closest_idx, -1, -1)
+                steps_needed = arrival * pit
+            else:
+                index_range = range(closest_idx + 1, len(track_coords))
+                
+                steps_needed = int((arrival + decay) * pit + 1)
+    
+            current_point = base_point.copy()
+            accumulated_distance = 0
+            generated = 0
+            last_cos, last_sin = None, None
+
+            for i in index_range:
+                
+                if dir_flag == 0:
+                    
+                    p_from = track_coords[i + 1]
+                    p_to = track_coords[i]
+                    seg_len = calc_distance(p_from, p_to)
+                    cos_a, sin_a = calc_direction(p_from, p_to)
+                    last_cos, last_sin = cos_a, sin_a
+                    
+                else:
+                    
+                    p_from = track_coords[i - 1]
+                    p_to = track_coords[i]
+                    seg_len = calc_distance(p_from, p_to)
+                    cos_a, sin_a = calc_direction(p_to, p_from)
+                    last_cos, last_sin = cos_a, sin_a
+
+                while interval < seg_len + accumulated_distance:
+                    
+                    move_dist = interval - accumulated_distance
+                    dx, dy = move_dist * cos_a, move_dist * sin_a
+                    
+                    if dir_flag == 0:
+                        
+                        current_point = [current_point[0] - dx, current_point[1] - dy]
+                        
+                    else:
+                        
+                        current_point = [current_point[0] + dx, current_point[1] + dy]
+    
+                    all_points.append(current_point.copy())
+                    generated += 1
+                    accumulated_distance = 0
+                    seg_len = calc_distance(current_point, p_to)
+    
+                    if generated >= steps_needed:
+                        break
+    
+                else:
+                    accumulated_distance += seg_len
+                    current_point = p_to
+    
+                if generated >= steps_needed:
+                    break
+                    
+            while generated < steps_needed:
+                
+                dx, dy = interval * last_cos, interval * last_sin
+                last_point = all_points[-1]
+                if dir_flag == 0:
+                    
+                    last_point = [last_point[0] - dx, last_point[1] - dy]
+                    
+                else:
+                    
+                    last_point = [last_point[0] + dx, last_point[1] + dy]
+                    
+                all_points.append(last_point.copy())
+                generated += 1
+      
+        arrival_steps = int(arrival * pit)
+        arrival_points = all_points[:arrival_steps][::-1]
+        decay_points = all_points[arrival_steps:steps_needed-1]
+
+        all_points = arrival_points + [base_point] + decay_points
+
+        point_df = pd.DataFrame({'x': [p[0] for p in all_points],'y': [p[1] for p in all_points]})
+        
+        return point_df
+        
+    def get_epsg_from_prj_text(wkt):
+
+        match = re.search(r'Zone_(\d{1,2})', wkt)
+        if not match:
+            print("Please change to plane rectangular coordinates")
+        
+        zone_num = int(match.group(1))
+        
+        if "JGD_2011" in wkt:
+            return 6668 + zone_num, 6668
+        elif "JGD_2000" in wkt:
+            return 2442 + zone_num, 4612
+        else:
+            print("Please change to plane rectangular coordinates")
+            
+    def calc_along_line_distance(line_coords, base_point_idx, base_point, before_min, after_max):
+        coords = np.array(line_coords)
+    
+        total_len_before = np.linalg.norm(coords[base_point_idx] - base_point)
+        total_len_after  = np.linalg.norm(coords[base_point_idx + 1] - base_point)
+    
+        if 0 <= before_min < base_point_idx:
+            segs_before = coords[before_min+1:base_point_idx+1]
+            segs_next   = coords[before_min:base_point_idx ]
+            total_len_before += np.sum(np.linalg.norm(segs_next - segs_before, axis=1))
+    
+        if after_max > base_point_idx and after_max < len(coords):
+            segs_after = coords[base_point_idx+1:after_max]
+            segs_next  = coords[base_point_idx + 2:after_max + 1]
+            total_len_after += np.sum(np.linalg.norm(segs_next - segs_after, axis=1))
+    
+        return total_len_before, total_len_after    
+        
+    def get_entry_exit_time(line_coords, polygon_bounds, base_point_idx, basepoint, speed):
+        
+        xmin, ymin, xmax, ymax = polygon_bounds
+        arr = np.array(line_coords) 
+        arr_id = np.arange(0, len(line_coords))
+        x, y = arr[:, 0], arr[:, 1]
+    
+        outside_mask = (x > xmin) & (x < xmax) & (y > ymin) & (y < ymax)
+        
+        outside_id = arr_id[outside_mask]
+        before_mask = outside_id<base_point_idx
+    
+        before = np.where(before_mask, outside_id, 9999)
+        before_min=np.min(before) -1 
+
+        after_mask = outside_id>base_point_idx
+        after = np.where(after_mask, outside_id, -9999)
+        after_max = np.max(after) +1 
+
+        before_dist, after_dist = calc_along_line_distance(line_coords, base_point_idx, basepoint, before_min, after_max)
+        arrive_time, decay_time = math.ceil(before_dist / 1000/ speed), math.ceil(after_dist / 1000/ speed)
+        return arrive_time, decay_time
+        
+    blocks = load_parameter_blocks(csv_input_path)
+    top_folder = np.array(blocks[0])[:, 1:][0][0]
+    base_point_path = top_folder + np.array(blocks[1])[:, 1:][0][0]
+    typhoon_track_template = top_folder + np.array(blocks[2])[:, 1:][0][0]
+    shift_to_base_point = int(np.array(blocks[3])[:, 1:][0][0])
+    pit = int(np.array(blocks[4])[:, 1:][0][0])
+    central_pressure = int(np.array(blocks[5])[:, 1:][0][0])
+    max_wind_radius = int(np.array(blocks[6])[:, 1:][0][0])
+    name_flg = int(np.array(blocks[7])[:, 1:][0][0])
+    typhoon_speed_list = np.array(blocks[8])[:, 1:].astype(float).flatten()
+    typhoon_speed_list = typhoon_speed_list[~np.isnan(typhoon_speed_list)].tolist()
+    typhoon_track_list = np.array(blocks[9])[:, 1:][0].tolist()
+    move_direction = np.array(blocks[10])[:, 1:].astype("int")[0].tolist()
+    time_until_arrival_and_decay = np.array(blocks[11])[:, 1:]
+    time_until_arrival_and_decay = [time_until_arrival_and_decay[i:i+2].astype(float) for i in range(0, len(time_until_arrival_and_decay), 2)]
+    time_until_arrival_and_decay = [list(map(list, zip(*pair))) for pair in time_until_arrival_and_decay]
+    name = np.array(blocks[12])[:, 1:]
+    name = [[v for v in name[:, i] if v not in [None, '', np.nan] and pd.notna(v)]for i in range(name.shape[1])]
+    case_distance = np.array(blocks[13])[:, 1:].astype(float)
+    case_distance =  [list(case_distance[~np.isnan(case_distance[:, i]), i]) for i in range(case_distance.shape[1])]
+
+    #output
+    baseline_template_path = r"aaa_baseline.shp" 
+    case_line_template_path = r"aaa_case_line.shp" 
+    point_template_path = r"aaa_Vkkk_bbb.shp" 
+    csv_template_path = r"\typhoon.csv" 
+
+    for speed in range(len(typhoon_speed_list)):
+
+        for typhoon_track in range(len(typhoon_track_list)):
+
+            typhoon_name = typhoon_track_list[typhoon_track]
+            
+            base_point_shapes = sf.Reader(base_point_path, encoding = 'cp932').shapes()
+
+            base_point_coords = list(base_point_shapes[0].points[0])
+
+            typhoon_track_path = typhoon_track_template.replace("aaa", typhoon_name)
+            typhoon_track_shapes = sf.Reader(typhoon_track_path, encoding = 'cp932').shapes()
+
+            typhoon_track_coords = [[list(typhoon_track_coord) for typhoon_track_coord in typhoon_track_shape.points] for typhoon_track_shape in typhoon_track_shapes]
+
+            track = typhoon_track_coords[0]
+            base_x, base_y = base_point_coords
+            dir_is_ns = move_direction[typhoon_track] == 1  # 1: NS方向, 0: EW方向
+            
+            distance = None
+            min_distance = None
+            closest_idx = 0
+            
+            for i in range(len(track) - 1):
+                track_x0, track_y0 = track[i]
+                track_x1, track_y1 = track[i + 1]
+                
+                if dir_is_ns:
+                    if (track_x0 < base_x < track_x1) or (track_x1 < base_x < track_x0):
+                        distance = abs(track_y0 - base_y)
+                else:
+                    if (track_y0 < base_y < track_y1) or (track_y1 < base_y < track_y0):
+                        distance = abs(track_x0 - base_x)
+
+                if distance is not None:
+                    if min_distance is None or distance < min_distance:
+                        min_distance = distance
+                        closest_idx = i    
+            
+            x0, y0 = track[closest_idx]
+            x1, y1 = track[closest_idx + 1]
+            
+            if x1 - x0 == 0:
+                raise ValueError("Path is vertical")
+            
+            slope = (y1 - y0) / (x1 - x0)
+            intercept = y0 - slope * x0
+            
+            if dir_is_ns:
+                ref_y = slope * base_x + intercept
+                shift = [0, base_y - ref_y]
+            else:
+                if slope == 0:
+                    raise ValueError("Path is horizontal")
+                ref_x = (base_y - intercept) / slope
+                shift = [base_x - ref_x, 0]
+
+            if shift_to_base_point == 0:
+                base_point_coords = [b - s for b, s in zip(base_point_coords, shift)]
+
+            else:
+                for shape in typhoon_track_shapes:
+                    
+                    shifted_shape = [[[x + shift[0], y + shift[1]] for x, y in shape.points]]
+
+                shifted_track_df = pd.DataFrame([{'geometry': shifted_shape, 'Id': 0}])
+
+                baseline_folder = top_folder + r"\output\baseline"
+                baseline_path = (baseline_folder + "\\" + baseline_template_path).replace('aaa', typhoon_name)
+
+                os.makedirs(baseline_folder, exist_ok=True)
+
+                with sf.Writer(baseline_path, shapeType=sf.POLYLINE) as _w:
+
+                    _w.field("Id", "N")
+
+                    for _, row in shifted_track_df.iterrows():
+
+                        _w.line(row['geometry'])
+                        _w.record(row["Id"])
+
+                _w.close()
+
+                prj_path(baseline_path, map_projection)
+                
+            if dir_is_ns:
+                
+                casex, casey = [[0 for _ in row] for row in case_distance], case_distance
+
+            else:
+
+                casex, casey = case_distance, [[0 for _ in row] for row in case_distance]
+
+            shifted_tracks = []
+
+            for i, case in enumerate(range(len(case_distance[typhoon_track]))):
+                
+                case_shift_x = casex[typhoon_track][case]
+                case_shift_y = casey[typhoon_track][case]
+            
+                if shift_to_base_point:
+                    case_shift_x += shift[0]
+                    case_shift_y += shift[1]
+            
+                shifted_case = [[[x + case_shift_x, y + case_shift_y] for x, y in shape.points] for shape in typhoon_track_shapes]
+                    
+                shifted_tracks.append({'geometry': shifted_case, 'Id': i})
+            
+            shifted_tracks_df = pd.DataFrame(shifted_tracks)
+
+            case_line_folder = top_folder + r"\output\typhoon_line"
+            case_line_path = (case_line_folder + "\\" + case_line_template_path).replace('aaa', typhoon_name)
+
+            os.makedirs(case_line_folder, exist_ok=True)
+
+            with sf.Writer(case_line_path, shapeType=sf.POLYLINE) as _w:
+
+                _w.field("Id", "N")
+
+                for _, row in shifted_tracks_df.iterrows():
+
+                    _w.line(row['geometry'])
+                    _w.record(row["Id"])
+
+            _w.close()
+
+            prj_path(case_line_path, map_projection)
+
+            interval_distance = typhoon_speed_list[speed] * 1000 / pit
+            
+            if extent !=  "DEFAULT":
+
+                spatial_extent = extract_extent(extent)
+                arrival_time, decay_time = get_entry_exit_time(shifted_shape[0], spatial_extent, closest_idx, base_point_coords, typhoon_speed_list[speed])
+
+            else:
+            
+                arrival_time, decay_time = time_until_arrival_and_decay[speed][typhoon_track]
+
+            point_df = generate_points_along_line(
+                track_coords=shifted_shape[0],
+                base_point=base_point_coords,
+                interval=interval_distance,
+                arrival=arrival_time,
+                decay= decay_time,
+                closest_idx = closest_idx,
+                pit = pit
+            )
+            
+            for case_index in range(len(case_distance[typhoon_track])):
+                
+                if name_flg == 0:
+                    
+                    final_name = str(case_index + 1).zfill(2)
+
+                else:
+                    
+                    final_name = name[typhoon_track][case_index]
+
+                shifted_points_df = point_df.copy()
+
+                shifted_points_df['x'] = shifted_points_df['x'] + casex[typhoon_track][case_index]
+                shifted_points_df['y'] = shifted_points_df['y'] + casey[typhoon_track][case_index]
+                shifted_points_df['dis'] = 0
+                shifted_points_df['r0'] = max_wind_radius
+                
+                start_time = datetime.datetime(1900, 1, 1, hour=0)
+                
+                shifted_points_df['time'] = [
+                    (start_time + datetime.timedelta(minutes=i * 60 / pit)).strftime('%y%m%d%H%M')
+                    for i in range(len(shifted_points_df))
+                ]
+                
+                if central_pressure == 0:
+                    projected_epsg, geodetic_epsg = get_epsg_from_prj_text(map_projection)
+                    source = osr.SpatialReference()
+                    source.ImportFromEPSG(projected_epsg)
+                    
+                    target = osr.SpatialReference()
+                    target.ImportFromEPSG(geodetic_epsg)
+
+                    transform = osr.CoordinateTransformation(source, target)
+                    
+                    transformed_points = [transform.TransformPoint(x, y) for x, y in zip(shifted_points_df['x'], shifted_points_df['y'])]
+                    latitudes = np.array([pt[1] for pt in transformed_points])
+                    
+                    condi = [
+                        (latitudes < 26),
+                        (latitudes >= 26) & (latitudes < 30),
+                        (latitudes >= 30) & (latitudes < 34),
+                        (latitudes >= 34) & (latitudes < 36),
+                        (latitudes >= 36) & (latitudes < 38),
+                        (latitudes >= 38)
+                    ]
+                    
+                    select = [880, 890, 900, 910, 930, 950]
+                    
+                    shifted_points_df['pc'] = np.select(condi, select)
+
+                else:
+                    
+                    shifted_points_df['pc'] = central_pressure
+
+
+                for shape in typhoon_track_shapes:
+
+                    shifted_coords = [(x + casex[typhoon_track][case_index], y + casey[typhoon_track][case_index]) for x, y in shape.points]
+
+                    points = [(x, y) for x, y in zip(shifted_points_df['x'], shifted_points_df['y'])]
+                    speed_mps = typhoon_speed_list[speed] * 1000 / 3600
+
+                    M = len(shifted_coords)
+                    N = len(shifted_points_df)
+                    vx_list = np.zeros(M)
+                    vy_list = np.zeros(M)
+                    
+                    for i in range(M - 1):
+                        dx = shifted_coords[i+1][0] - shifted_coords[i][0]
+                        dy = shifted_coords[i+1][1] - shifted_coords[i][1]
+                        angle = math.atan2(dy, dx)
+                        vx_list[i] = speed_mps * math.cos(angle)
+                        vy_list[i] = speed_mps * math.sin(angle)
+                    
+                    vx_list[-1] = vx_list[-2]
+                    vy_list[-1] = vy_list[-2]
+                    
+                    assigned_vx = np.zeros(N)
+                    assigned_vy = np.zeros(N)
+
+                    for idx, (px, py) in enumerate(points):
+
+                        for j in range(M - 1):
+                            x0, y0 = shifted_coords[j]
+                            x1, y1 = shifted_coords[j+1]
+                            if min(x0, x1) <= px <= max(x0, x1) and min(y0, y1) <= py <= max(y0, y1):
+                                assigned_vx[idx] = vx_list[j]
+                                assigned_vy[idx] = vy_list[j]
+                                break
+                                
+                shifted_points_df['vx'], shifted_points_df['vy'] = assigned_vx, assigned_vy
+                
+                point_template_folder = top_folder + r"\output\typhoon_point\aaa\Vkkk\aaa_Vkkk_bbb"
+                speed_name = typhoon_speed_list[speed]
+                speed_str = str(int(speed_name)) if speed_name.is_integer() else str(speed_name).replace('.', '-')
+                
+                point_folder = point_template_folder\
+                    .replace("aaa", typhoon_name)\
+                    .replace("bbb", final_name)\
+                    .replace("kkk", speed_str)
+
+                point_path = (point_template_folder + "\\" + point_template_path)\
+                    .replace("aaa", typhoon_name)\
+                    .replace("bbb", final_name)\
+                    .replace("kkk", speed_str)
+                
+                os.makedirs(point_folder, exist_ok=True)    
+
+                with sf.Writer(point_path, shapeType=sf.POINT) as _w:
+
+                    _w.field("time", "C")
+                    _w.field("x", 'F', decimal = 5)
+                    _w.field("y", 'F', decimal = 5)
+                    _w.field("dis" , 'N')
+                    _w.field("vx", "F", decimal = 2)
+                    _w.field("vy", "F", decimal = 2)
+                    _w.field("pc" , 'N')
+                    _w.field("r0", 'N')
+
+                    for _, row in shifted_points_df.iterrows():
+
+                        _w.point(row['x'], row["y"])
+                        _w.record(row["time"],row['x'], row["y"], row["dis"], row["vx"], row["vy"], row["pc"], row["r0"])
+
+                _w.close()
+
+                prj_path(point_path, map_projection)
+
+                csv_template_folder = top_folder + r"\output\typhoon_csv\aaa\Vkkk\aaa_Vkkk_bbb"
+
+                csv_folder = csv_template_folder\
+                    .replace("aaa", typhoon_name)\
+                    .replace("bbb", final_name)\
+                    .replace("kkk", speed_str)
+
+                csv_path = (csv_template_folder + "\\" + csv_template_path)\
+                    .replace("aaa", typhoon_name)\
+                    .replace("bbb", final_name)\
+                    .replace("kkk", speed_str)
+
+                os.makedirs(csv_folder, exist_ok=True)    
+
+                shifted_points_df.to_csv(csv_path, index = False, columns = ['time', 'x', 'y', 'dis', 'vx', 'vy', 'pc', 'r0'])
+
+typhoon()
+
+import arcpy
+
+class ToolValidator:
+    def __init__(self):
+        self.params = arcpy.GetParameterInfo()
+
+    def updateParameters(self):
+        if not self.params[1].altered:  # 出力座標系（例: param[1]）が未設定の場合のみ
+            aprx = arcpy.mp.ArcGISProject("CURRENT")
+            map_obj = aprx.activeMap
+            if map_obj:
+                sr = map_obj.spatialReference
+                self.params[1].value = sr
